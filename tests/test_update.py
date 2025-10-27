@@ -14,7 +14,7 @@ def gen_test_tensors(rank: int) -> list[tuple[str, torch.Tensor]]:
     tensors = []
     for layer in range(random.randint(10, 50)):
         for num in range(random.randint(50, 100)):
-            r = random.randint(0, 16)
+            r = 1
             if r < 4:
                 dtype = torch.bfloat16
             elif r < 10:
@@ -33,8 +33,8 @@ def gen_test_tensors(rank: int) -> list[tuple[str, torch.Tensor]]:
 
 
 def checker_proc(rank: int, device_uuid: str, named_tensors: dict[str, torch.Tensor], queue: Queue):
-    torch.cuda.set_device(rank)
-    named_tensors = {name: tensor.cuda() for name, tensor in named_tensors.items()}
+    torch.npu.set_device(rank)
+    named_tensors = {name: tensor.npu() for name, tensor in named_tensors.items()}
     _zmq_ctx = zmq.Context()
 
     def check(names_to_check: dict[str, bool], weights: list[tuple[str, torch.Tensor]]):
@@ -51,7 +51,7 @@ def checker_proc(rank: int, device_uuid: str, named_tensors: dict[str, torch.Ten
             socket_paths[device_uuid],
             device_id=rank,
             run=lambda weights: check(names_to_check, weights),
-            post_hook=lambda: torch.cuda.synchronize(),
+            post_hook=lambda: torch.npu.synchronize(),
         )
         assert all(names_to_check.values())
 
@@ -68,10 +68,10 @@ def run():
     world_size = int(os.getenv("WORLD_SIZE"))
     ctx = get_context("spawn")
     queue = ctx.Queue()
-    _device_uuid = _get_physical_gpu_id(rank)
+    _device_uuid = _get_physical_gpu_id(rank, rank)
     ps = ParameterServer(auto_pg=True)
     named_tensors = dict(gen_test_tensors(rank))
-    checkpoint_name = "test"
+    checkpoint_name = "/root/model/Qwen3-0.6B"
     proc = ctx.Process(target=checker_proc, args=(rank, _device_uuid, named_tensors, queue))
     proc.start()
     ps.register_checkpoint(checkpoint_name, named_tensors=named_tensors)

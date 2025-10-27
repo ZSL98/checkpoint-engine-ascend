@@ -34,7 +34,7 @@ def check_vllm_ready(endpoint: str, inference_parallel_size: int, uds: str | Non
         transport = httpx.HTTPTransport(uds=uds)
     while True:
         try:
-            response = httpx.Client(transport=transport).get(f"{endpoint}/health", timeout=10)
+            response = httpx.Client(transport=transport).get(f"{endpoint}/health", timeout=30)
             response.raise_for_status()
             break
         except (httpx.ConnectError, httpx.HTTPStatusError) as e:
