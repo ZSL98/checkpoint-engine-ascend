@@ -289,6 +289,8 @@ def _concat_tp_weights(
 
 
 def _get_physical_gpu_id(device_manager: DeviceManager, rank_id: int, device_index: int | None = None) -> str:
+    print(f"NPU-{rank_id}")
+    return f"NPU-{rank_id}"
     try:
         # if device_manager.device_type == "npu":
         return f"NPU-{rank_id}"
@@ -712,8 +714,10 @@ class ParameterServer:
                 Notice that if auto_pg is True, will destroy the process group after update.
             mem_fraction: The proportion (as a fraction) of the current free CUDA memory for allocation.
         """
-        self._rank = rank or int(os.environ.get("RANK", None))
-        self._world_size = world_size or int(os.environ.get("WORLD_SIZE", None))
+        # self._rank = rank or int(os.environ.get("RANK", None))
+        # self._world_size = world_size or int(os.environ.get("WORLD_SIZE", None))
+        self._rank = rank
+        self._world_size = world_size
         self.device_manager = DeviceManager()
         self._gpu_count = gpu_count or self.device_manager.device_module.device_count()
         self._local_rank = self._rank % self._gpu_count
@@ -875,7 +879,10 @@ class ParameterServer:
             master_port: The specified port of the master node. If not set, will use _get_master_port to get the port.
             timeout: The timeout of the process group.
         """
-        master_addr = master_addr or os.getenv("MASTER_ADDR")
+        # master_addr = master_addr or os.getenv("MASTER_ADDR")
+        #TODO(shulai): The process group addr and port is ad-hoc here. Remember to handle it.
+        master_addr = "localhost"
+        master_port = 12345
         assert master_addr, "master_addr is required"
         store = dist.TCPStore(
             master_addr,

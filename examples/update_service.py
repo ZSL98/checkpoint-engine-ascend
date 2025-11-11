@@ -8,11 +8,12 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Literal
 
+import asyncio
+import ray
 import httpx
 import torch
 import torch.distributed as dist
 from loguru import logger
-from safetensors import safe_open
 
 from checkpoint_engine.ps import ParameterServer, request_inference_to_update
 
@@ -25,22 +26,24 @@ def timer(msg: str):
     logger.info(f"{msg} duration: {end - start:.2f} seconds")
 
 
-def check_vllm_ready(endpoint: str, inference_parallel_size: int, uds: str | None = None):
+async def check_vllm_ready(rank: int, endpoint: str, inference_parallel_size: int, uds: str | None = None):
     if rank != rank // inference_parallel_size * inference_parallel_size:
         return
     retry_num = 0
-    transport = None
-    if uds is not None:
-        transport = httpx.HTTPTransport(uds=uds)
-    while True:
-        try:
-            response = httpx.Client(transport=transport).get(f"{endpoint}/health", timeout=30)
-            response.raise_for_status()
-            break
-        except (httpx.ConnectError, httpx.HTTPStatusError) as e:
-            retry_num += 1
-            logger.warning(f"fail to check vllm ready, retry {retry_num} times, error: {e}")
-            time.sleep(5)
+    print("before connection...")
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                response = await client.get(f"{endpoint}/health", timeout=600)
+                response.raise_for_status()
+                logger.info(f"Rank {rank}: vLLM server at {endpoint} is ready")
+                break
+            except (httpx.ConnectError, httpx.HTTPStatusError, httpx.TimeoutException) as e:
+                retry_num += 1
+                logger.warning(
+                    f"Rank {rank}: fail to check vllm ready, retry {retry_num} times, error: {e}"
+                )
+                await asyncio.sleep(5)
 
 
 def split_checkpoint_files(checkpoint_path: str, rank: int, world_size: int) -> list[str]:
@@ -62,19 +65,21 @@ def split_tensors(checkpoint_path: str, rank: int, world_size: int) -> dict[str,
     for name, file in weight_keys[rank * weights_per_rank : (rank + 1) * weights_per_rank]:
         fn_tensors[file].append(name)
     named_tensors = {}
+    #TODO(shulai): safe_open has to be imported here, otherwise object error, don't know why
+    from safetensors.torch import safe_open
     for file, names in fn_tensors.items():
-        with safe_open(os.path.join(checkpoint_path, file), framework="pt") as f:
+        with safe_open(os.path.join(checkpoint_path, file)) as f:
             for name in names:
                 named_tensors[name] = f.get_tensor(name)
     return named_tensors
 
 
 def req_inference(
+    rank: int,
     endpoint: str,
     inference_parallel_size: int,
     uds: str | None = None,
 ) -> Callable[[list[tuple[str, str]]], None]:
-    rank = int(os.getenv("RANK", None))
     src = rank // inference_parallel_size * inference_parallel_size
 
     def req_func(socket_paths: list[tuple[str, str]]):
@@ -88,7 +93,8 @@ def req_inference(
     return req_func
 
 
-def update_weights(
+async def update_weights(
+    rank: int,
     ps: ParameterServer,
     checkpoint_name: str,
     checkpoint_files: list[str],
@@ -100,9 +106,7 @@ def update_weights(
     update_method: Literal["broadcast", "p2p", "all"] = "broadcast",
     uds: str | None = None,
 ):
-    ps.register_checkpoint(checkpoint_name, files=checkpoint_files, named_tensors=named_tensors)
-    ps.init_process_group()
-    check_vllm_ready(endpoint, inference_parallel_size, uds)
+    # await check_vllm_ready(rank, endpoint, inference_parallel_size, uds)
     dist.barrier()
     with timer("Gather metas"):
         ps.gather_metas(checkpoint_name)
@@ -121,33 +125,45 @@ def update_weights(
         with timer("Update weights with setting ranks"):
             ps.update(checkpoint_name, req_func, ranks=list(range(inference_parallel_size)))
 
+@ray.remote(num_cpus=1)
+class UpdateService:
+    def __init__(self, args, rank, world_size):
+        self.args = args
+        import os
+        self.rank = rank
+        self.world_size = world_size
+        os.environ["HCCL_NPU_SOCKET_PORT_RANGE"] = "auto"
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "1,2,3,4"
 
-def join(
-    ps: ParameterServer,
-    checkpoint_name: str,
-    load_metas_file: str,
-    req_func: Callable[[list[tuple[str, str]]], None],
-    inference_parallel_size: int,
-    endpoint: str,
-    uds: str | None = None,
-):
-    assert load_metas_file, "load_metas_file is required"
-    with open(load_metas_file, "rb") as f:
-        metas = pickle.load(f)
-    ps.init_process_group()
-    check_vllm_ready(endpoint, inference_parallel_size, uds)
-    dist.barrier()
-    with timer("Gather metas before join"):
-        ps.gather_metas(checkpoint_name)
-    ps.load_metas(metas)
-    with timer(
-        f"Update weights with setting ranks as range(0, {inference_parallel_size}) by using p2p"
-    ):
-        ps.update(checkpoint_name, req_func, ranks=list(range(inference_parallel_size)))
+        self.ps = ParameterServer(rank=self.rank, world_size=self.world_size, auto_pg=True)
+        if os.path.exists(os.path.join(self.args.checkpoint_path, "model.safetensors.index.json")):
+            with timer("Load from disk"):
+                self.named_tensors = split_tensors(self.args.checkpoint_path, self.rank, self.world_size)
+                self.checkpoint_files = []
+        else:
+            self.checkpoint_files = split_checkpoint_files(self.args.checkpoint_path, self.rank, self.world_size)
+            self.named_tensors = {}
+        self.ps.register_checkpoint(self.args.checkpoint_name, files=self.checkpoint_files, named_tensors=self.named_tensors)
+        self.ps.init_process_group()
+        self.req_func = req_inference(self.rank, self.args.endpoint, self.args.inference_parallel_size, self.args.uds)
 
+    async def trigger_update(self):
+        await update_weights(
+            self.rank,
+            self.ps,
+            self.args.checkpoint_name,
+            self.checkpoint_files,
+            self.named_tensors,
+            self.req_func,
+            self.args.inference_parallel_size,
+            self.args.endpoint,
+            self.args.save_metas_file,
+            self.args.update_method,
+            self.args.uds,
+        )
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Update weights example")
+def main():
+    parser = argparse.ArgumentParser(description="Pre-initialized Weight Update Service (Initialized by shulai)")
     parser.add_argument("--checkpoint-path", type=str, default=None)
     parser.add_argument("--save-metas-file", type=str, default=None)
     parser.add_argument("--load-metas-file", type=str, default=None)
@@ -158,38 +174,18 @@ if __name__ == "__main__":
     parser.add_argument("--update-method", type=str, default="broadcast")
     parser.add_argument("--uds", type=str, default=None)
     args = parser.parse_args()
-    rank = int(os.getenv("RANK"))
-    world_size = int(os.getenv("WORLD_SIZE"))
-    req_func = req_inference(args.endpoint, args.inference_parallel_size, args.uds)
-    ps = ParameterServer(auto_pg=True)
-    if args.load_metas_file:
-        join(
-            ps,
-            args.checkpoint_name,
-            args.load_metas_file,
-            req_func,
-            args.inference_parallel_size,
-            args.endpoint,
-            args.uds,
-        )
-    else:
-        if os.path.exists(os.path.join(args.checkpoint_path, "model.safetensors.index.json")):
-            with timer("Load from disk"):
-                named_tensors = split_tensors(args.checkpoint_path, rank, world_size)
-                checkpoint_files = []
-        else:
-            checkpoint_files = split_checkpoint_files(args.checkpoint_path, rank, world_size)
-            named_tensors = {}
-        update_weights(
-            ps,
-            args.checkpoint_name,
-            checkpoint_files,
-            named_tensors,
-            req_func,
-            args.inference_parallel_size,
-            args.endpoint,
-            args.save_metas_file,
-            args.update_method,
-            args.uds,
-        )
-    time.sleep(args.sleep_time)
+
+    os.environ["HCCL_NPU_SOCKET_PORT_RANGE"] = "auto"
+    ray.init()
+    current_rank = os.getenv("RANK")
+    world_size = os.getenv("WORLD_SIZE")
+    actor_name = f"update_service_rank_{current_rank}"
+    service = UpdateService.options(name=actor_name, namespace="weight_loader").remote(args, int(current_rank), int(world_size))
+    logger.info(f"[RANK {current_rank}] Actor Created: {actor_name}")
+    
+    # ray.get(service.trigger_update.remote())
+    while True:
+        time.sleep(600)
+
+if __name__ == "__main__":
+    main()
